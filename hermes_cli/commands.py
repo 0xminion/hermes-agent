@@ -376,13 +376,23 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     """
     all_commands = list(telegram_bot_commands())
 
-    # Append active skill commands (already filtered for disabled/platform)
+    # Append active BUILT-IN skill commands only (not user-installed hub skills).
+    # User-installed skills stay accessible via /skills and by typing the command
+    # directly, but don't clutter the Telegram menu.
     try:
         from agent.skill_commands import get_skill_commands
+        from pathlib import Path
+        # The repo's built-in skills live under <repo>/skills/
+        _repo_skills_dir = str(Path(__file__).resolve().parent.parent / "skills")
         skill_cmds = get_skill_commands()
         for cmd_key in sorted(skill_cmds):
+            info = skill_cmds[cmd_key]
+            # Only include skills whose SKILL.md is in the repo's skills/ dir
+            skill_path = info.get("skill_md_path", "")
+            if not skill_path.startswith(_repo_skills_dir):
+                continue
             name = cmd_key.lstrip("/").replace("-", "_")
-            desc = skill_cmds[cmd_key].get("description", "")
+            desc = info.get("description", "")
             # Telegram descriptions max 256 chars
             if len(desc) > 256:
                 desc = desc[:253] + "..."
