@@ -55,6 +55,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
+    MessageSource,
     MessageType,
     SendResult,
     cache_image_from_bytes,
@@ -543,7 +544,12 @@ class TelegramAdapter(BasePlatformAdapter):
                 filters.PHOTO | filters.VIDEO | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL,
                 self._handle_media_message
             ))
-            
+
+            # Register callback query handler for inline keyboard buttons
+            # (e.g. session recovery and approval buttons).
+            from telegram.ext import CallbackQueryHandler
+            self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
+
             # Start polling — retry initialize() for transient TLS resets
             try:
                 from telegram.error import NetworkError, TimedOut
@@ -727,12 +733,22 @@ class TelegramAdapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None
+        metadata: Optional[Dict[str, Any]] = None,
+        reply_markup: Optional[Any] = None,
     ) -> SendResult:
-        """Send a message to a Telegram chat."""
+        """Send a message to a Telegram chat.
+
+        Args:
+            chat_id: Target chat identifier.
+            content: Message text (markdown supported).
+            reply_to: Optional message ID to reply to.
+            metadata: Optional dict with thread_id for forum topics.
+            reply_markup: Optional telegram.InlineKeyboardMarkup for inline
+                keyboard buttons (e.g. recovery or approval buttons).
+        """
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
         try:
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -775,6 +791,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 parse_mode=ParseMode.MARKDOWN_V2,
                                 reply_to_message_id=reply_to_id,
                                 message_thread_id=effective_thread_id,
+                                reply_markup=reply_markup,
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -787,6 +804,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     parse_mode=None,
                                     reply_to_message_id=reply_to_id,
                                     message_thread_id=effective_thread_id,
+                                    reply_markup=reply_markup,
                                 )
                             else:
                                 raise
@@ -1179,7 +1197,16 @@ class TelegramAdapter(BasePlatformAdapter):
                     e,
                     exc_info=True,
                 )
-    
+
+    async def stop_typing(self, chat_id: str) -> None:
+        """Stop typing indicator.
+
+        Telegram chat actions are one-shot (transient) — there is no persistent
+        typing loop to cancel. This method is a no-op, kept for interface
+        compatibility with platforms that use background typing loops.
+        """
+        pass
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a Telegram chat."""
         if not self._bot:
@@ -1538,7 +1565,48 @@ class TelegramAdapter(BasePlatformAdapter):
         
         event = self._build_message_event(update.message, MessageType.COMMAND)
         await self.handle_message(event)
-    
+
+    async def _handle_callback_query(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle inline keyboard button presses.
+
+        Parses callback_data to determine the action:
+        - "session:restore" — restore the most recently expired session for this user.
+        - "session:reset"   — confirm the user wants to start a fresh session.
+
+        Acknowledges the callback immediately to prevent Telegram's timeout warning,
+        then emits the appropriate session event to the gateway for processing.
+        """
+        query = update.callback_query
+        if not query:
+            return
+
+        chat_id = str(query.message.chat.id) if query.message else None
+        data = query.data or ""
+
+        # Always acknowledge immediately to clear Telegram's "loading..." state
+        try:
+            await query.answer()
+        except Exception:
+            pass
+
+        if not chat_id:
+            return
+
+        if data == "session:restore":
+            # Emit a session:restore event so the gateway's normal session
+            # restore flow handles the transition.
+            await self.handle_message(MessageEvent(
+                source=MessageSource(platform=Platform.TELEGRAM, chat_id=chat_id),
+                type=MessageType.COMMAND,
+                text="/resume",
+                metadata={"origin": "callback"},
+            ))
+        elif data == "session:reset":
+            # User explicitly chose "Start fresh" — acknowledge and do nothing
+            # more; the gateway will continue with the current (already-reset)
+            # session.
+            pass
+
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
         if not update.message:

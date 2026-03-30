@@ -1819,7 +1819,16 @@ class GatewayRunner:
             return await self._handle_help_command(event)
         
         if canonical == "status":
-            return await self._handle_status_command(event)
+            status_result = await self._handle_status_command(event)
+            # status_result is either str or Tuple[str, reply_markup]
+            if isinstance(status_result, tuple):
+                status_text, reply_markup = status_result
+            else:
+                status_text = status_result
+                reply_markup = None
+            if adapter and source.chat_id:
+                await adapter.send(source.chat_id, status_text, reply_markup=reply_markup)
+            return None  # Already sent; don't double-send via _send_response
         
         if canonical == "stop":
             return await self._handle_stop_command(event)
